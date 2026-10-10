@@ -1,0 +1,11 @@
+{
+  "name": "vinted-photo-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Telegram bot: send a photo, get similar items on Vinted",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "set-webhook": "node scripts/set-webhook.js"
+  }
+}
