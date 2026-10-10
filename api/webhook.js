@@ -1,11 +1,11 @@
 // Vinted Photo Search Bot — Telegram webhook (Vercel serverless function)
-// Фото → Claude розпізнає річ → пошук на Vinted → схожі оголошення
+// Фото → безкоштовний AI (Groq) розпізнає річ → пошук на Vinted → схожі оголошення
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TG = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const TG_FILE = `https://api.telegram.org/file/bot${BOT_TOKEN}`;
 const DOMAIN = process.env.VINTED_DOMAIN || 'www.vinted.de';
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5';
+const MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
 const MAX_RESULTS = 6;
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36';
@@ -40,7 +40,7 @@ async function downloadTelegramFile(fileId) {
   return buf.toString('base64');
 }
 
-// ---------- Claude (розпізнавання фото) ----------
+// ---------- AI (розпізнавання фото, Groq) ----------
 const PROMPT = (caption) => `Ти допомагаєш знайти схожі речі на Vinted (${DOMAIN}).
 Подивись на фото і визнач, що це за річ (одяг, взуття, аксесуар, техніка, декор тощо).
 ${caption ? `Побажання користувача (врахуй їх): "${caption}"` : ''}
@@ -60,30 +60,31 @@ ${caption ? `Побажання користувача (врахуй їх): "${c
 - якщо користувач вказав розмір — додай його до першого запиту`;
 
 async function analyzePhoto(base64, mediaType, caption) {
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
+  // Groq — безкоштовний OpenAI-сумісний API з підтримкою фото
+  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
+      authorization: `Bearer ${process.env.GROQ_API_KEY}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 500,
+      max_tokens: 2000,
+      temperature: 0.2,
       messages: [
         {
           role: 'user',
           content: [
-            { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
             { type: 'text', text: PROMPT(caption) },
+            { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } },
           ],
         },
       ],
     }),
   });
   const data = await r.json();
-  if (!r.ok) throw new Error(`Claude API: ${data?.error?.message || r.status}`);
-  const text = data.content?.map((c) => c.text || '').join('') || '';
+  if (!r.ok) throw new Error(`Groq API: ${data?.error?.message || r.status}`);
+  const text = (data.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '');
   const json = text.match(/\{[\s\S]*\}/);
   if (!json) throw new Error('AI не повернув результат');
   const parsed = JSON.parse(json[0]);
