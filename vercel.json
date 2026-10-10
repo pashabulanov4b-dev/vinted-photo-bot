@@ -1,5 +1,8 @@
 {
+  "fluid": true,
   "functions": {
-    "api/webhook.js": { "maxDuration": 60 }
+    "api/webhook.js": {
+      "maxDuration": 300
+    }
   }
 }

@@ -4,8 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Telegram bot: send a photo, get similar items on Vinted",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "set-webhook": "node scripts/set-webhook.js"
+  },
+  "dependencies": {
+    "@vercel/functions": "^2.0.0"
   }
 }
