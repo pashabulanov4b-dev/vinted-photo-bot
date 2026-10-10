@@ -15,7 +15,7 @@ const api = (m, body) =>
 console.log(await api('setWebhook', {
   url: `${baseUrl.replace(/\/$/, '')}/api/webhook`,
   secret_token: secret || undefined,
-  allowed_updates: ['message'],
+  allowed_updates: ['message', 'callback_query'],
   drop_pending_updates: true,
 }));
 console.log(await api('setMyCommands', { commands: [{ command: 'start', description: 'Як користуватись ботом' }] }));

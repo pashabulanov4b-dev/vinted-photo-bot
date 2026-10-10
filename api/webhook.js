@@ -77,7 +77,7 @@ ${JSON_SHAPE}
 
 ${LANG_RULES}`;
 
-async function askAI(content) {
+async function askJSON(content) {
   // Groq — безкоштовний OpenAI-сумісний API з підтримкою фото
   const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
@@ -97,12 +97,19 @@ async function askAI(content) {
   const text = (data.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '');
   const json = text.match(/\{[\s\S]*\}/);
   if (!json) throw new Error('AI не повернув результат');
-  const parsed = JSON.parse(json[0]);
-  // Страховка: відкидаємо запити з кирилицею, лишаємо тільки DE/EN
-  parsed.queries = (parsed.queries || [])
+  return JSON.parse(json[0]);
+}
+
+// Страховка: відкидаємо запити з кирилицею, лишаємо тільки DE/EN
+const cleanQueries = (qs, max = 3) =>
+  (qs || [])
     .map((q) => String(q || '').trim())
     .filter((q) => q && !/[\u0400-\u04FF]/.test(q))
-    .slice(0, 3);
+    .slice(0, max);
+
+async function askAI(content) {
+  const parsed = await askJSON(content);
+  parsed.queries = cleanQueries(parsed.queries);
   if (!parsed.queries.length) throw new Error('AI не зміг розпізнати річ');
   return parsed;
 }
@@ -114,6 +121,39 @@ const analyzePhoto = (base64, mediaType, caption) =>
   ]);
 
 const analyzeText = (text) => askAI(TEXT_PROMPT(text));
+
+const OUTFIT_PROMPT = (caption, count) => `Ти стиліст і допомагаєш зібрати аутфіт на Vinted.
+${count > 1 ? `Ось ${count} фото — це частини ОДНОГО образу (різні ракурси або окремі речі). Не дублюй ту саму річ, якщо вона є на кількох фото.` : 'На фото — образ (аутфіт).'}
+Визнач кожну окрему річ образу: верхній одяг, верх, низ, сукня, взуття, сумка, головний убір, помітні аксесуари. Максимум 6 речей, від найпомітнішої.
+${caption ? `Побажання користувача (врахуй їх): "${caption}"` : ''}
+
+Поверни ТІЛЬКИ JSON без пояснень:
+{
+  "style_uk": "стиль образу українською (до 8 слів)",
+  "price_max": число в євро, якщо користувач вказав бюджет на ОДНУ річ, інакше null,
+  "items": [
+    { "emoji": "один емодзі для речі", "name_uk": "назва речі українською (до 6 слів)", "queries": ["точний запит", "ширший запит"] }
+  ]
+}
+
+Правила для queries:
+- ТІЛЬКИ німецькою або англійською, жодної кирилиці
+- перший запит — німецькою, другий — німецькою або англійською
+- бренди латиницею, лише якщо видно логотип; не вигадуй бренд
+- 2–5 слів: (бренд) + тип речі + колір/матеріал/фасон, напр. "Lederjacke schwarz oversize", "Mom Jeans hellblau", "chunky sneaker white"`;
+
+async function analyzeOutfit(images, caption) {
+  const parsed = await askJSON([
+    { type: 'text', text: OUTFIT_PROMPT(caption, images.length) },
+    ...images.map((img) => ({ type: 'image_url', image_url: { url: `data:${img.mediaType};base64,${img.base64}` } })),
+  ]);
+  parsed.items = (parsed.items || [])
+    .map((it) => ({ ...it, queries: cleanQueries(it.queries, 2) }))
+    .filter((it) => it.queries.length)
+    .slice(0, 6);
+  if (!parsed.items.length) throw new Error('AI не знайшов речей на фото');
+  return parsed;
+}
 
 // ---------- Vinted ----------
 let vintedCookie = null;
@@ -175,6 +215,7 @@ function normalizeItem(it) {
     id: it.id,
     title: it.title || 'Без назви',
     price,
+    amount: Number(typeof it.price === 'object' ? it.price?.amount : it.price) || 0,
     brand: it.brand_title || '',
     size: it.size_title || '',
     url: it.url || `https://${DOMAIN}/items/${it.id}`,
@@ -183,7 +224,7 @@ function normalizeItem(it) {
 }
 
 // Йдемо від точного запиту до ширшого, поки не наберемо достатньо результатів
-async function findSimilar(queries, priceMax) {
+async function findSimilar(queries, priceMax, limit = MAX_RESULTS) {
   const seen = new Set();
   const results = [];
   for (const q of queries) {
@@ -192,21 +233,24 @@ async function findSimilar(queries, priceMax) {
       if (seen.has(it.id)) continue;
       seen.add(it.id);
       results.push(it);
-      if (results.length >= MAX_RESULTS) return results;
+      if (results.length >= limit) return results;
     }
   }
   return results;
 }
 
 // ---------- Відповіді користувачу ----------
-const WELCOME = `👋 Привіт! Надішли мені <b>фото речі</b> — я знайду схожі оголошення на Vinted.
+const WELCOME = `👋 Привіт! Я шукаю речі на Vinted по фото.
 
-💡 Можна додати підпис до фото, напр.:
-• <i>розмір M</i>
-• <i>до 30€</i>
-• <i>тільки чорні</i>
+📸 <b>Одне фото</b> — обери, що шукати:
+• 🔎 <b>схожу річ</b>
+• 👗 <b>весь аутфіт</b> — знайду кожну річ з образу окремо
 
-Або просто напиши текстом, що шукаєш — можна українською, я сам перекладу для пошуку 🇩🇪🇬🇧`;
+🖼 <b>Кілька фото альбомом</b> — зберу з них один аутфіт.
+
+💡 Підпис до фото враховується: <i>розмір M</i>, <i>до 30€</i>, <i>тільки чорні</i>. Слово <i>аутфіт</i> у підписі — одразу шукаю весь образ.
+
+✍️ Або просто напиши текстом, що шукаєш — можна українською, я сам перекладу 🇩🇪🇬🇧`;
 
 function queryButtons(queries, priceMax) {
   return queries.map((q) => [{ text: `🔎 ${q}`, url: searchUrl(q, priceMax) }]);
@@ -270,7 +314,175 @@ async function runSearch(chatId, statusId, analysis) {
   }
 }
 
+// ---------- Сховище для альбомів (Upstash Redis, опційно) ----------
+const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const hasRedis = Boolean(REDIS_URL && REDIS_TOKEN);
+
+async function redis(...cmd) {
+  const r = await fetch(REDIS_URL, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${REDIS_TOKEN}`, 'content-type': 'application/json' },
+    body: JSON.stringify(cmd),
+  });
+  const data = await r.json();
+  if (data.error) throw new Error(`Redis: ${data.error}`);
+  return data.result;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Telegram надсилає альбом окремими повідомленнями з однаковим media_group_id.
+// Кожне фото кладемо в Redis; обробляє альбом той виклик, після якого 2.5 с не приходило нових фото.
+async function collectAlbum(msg, fileId) {
+  const key = `mg:${msg.media_group_id}`;
+  await redis('RPUSH', key, fileId);
+  await redis('EXPIRE', key, 120);
+  if (msg.caption) await redis('SET', `${key}:cap`, msg.caption, 'EX', 120);
+  await redis('SET', `${key}:last`, String(Date.now()), 'EX', 120);
+
+  await sleep(2500);
+  const last = Number(await redis('GET', `${key}:last`));
+  if (Date.now() - last < 2300) return null; // ще надходять фото — обробить пізніший виклик
+  const lock = await redis('SET', `${key}:lock`, '1', 'NX', 'EX', 120);
+  if (lock !== 'OK') return null; // вже обробляється
+  const fileIds = await redis('LRANGE', key, 0, -1);
+  const caption = (await redis('GET', `${key}:cap`)) || '';
+  return { fileIds: [...new Set(fileIds)], caption };
+}
+
+// ---------- Аутфіт ----------
+const MAX_OUTFIT_PHOTOS = 3; // ліміт моделі Groq на кількість фото в одному запиті
+
+async function runOutfit(chatId, statusId, fileIds, caption, extraNote = '') {
+  const setStatus = (text) => tg('editMessageText', { chat_id: chatId, message_id: statusId, text });
+  let outfit;
+  try {
+    const images = [];
+    for (const id of fileIds.slice(0, MAX_OUTFIT_PHOTOS)) {
+      images.push({ base64: await downloadTelegramFile(id), mediaType: 'image/jpeg' });
+    }
+    outfit = await analyzeOutfit(images, caption);
+  } catch (e) {
+    console.error('Outfit analyze error:', e.message);
+    return setStatus('😕 Не вдалося розібрати образ. Спробуй фото, де людину видно на повний зріст і речі добре помітно.');
+  }
+
+  const list = outfit.items.map((it) => `${it.emoji || '•'} ${it.name_uk}`).join('\n');
+  await setStatus(`👗 ${outfit.style_uk}\n\nШукаю на Vinted:\n${list}${extraNote}`);
+
+  // Шукаємо кожну річ (по 2 паралельно, щоб не злити Vinted)
+  const results = [];
+  let blocked = false;
+  for (let i = 0; i < outfit.items.length; i += 2) {
+    const batch = outfit.items.slice(i, i + 2);
+    const found = await Promise.all(
+      batch.map((it) =>
+        findSimilar(it.queries, outfit.price_max, 3).catch((e) => {
+          console.error('Outfit search error:', e.message);
+          blocked = true;
+          return [];
+        }),
+      ),
+    );
+    batch.forEach((it, j) => results.push({ piece: it, items: found[j] }));
+  }
+
+  await tg('deleteMessage', { chat_id: chatId, message_id: statusId });
+
+  // Альбом: найкращий збіг для кожної речі
+  const best = results.filter((r) => r.items[0]?.photo);
+  if (best.length >= 2) {
+    await tg('sendMediaGroup', {
+      chat_id: chatId,
+      media: best.map((r) => ({
+        type: 'photo',
+        media: r.items[0].photo,
+        caption: `${r.piece.emoji || ''} ${r.piece.name_uk}\n${r.items[0].title} · ${r.items[0].price}`,
+      })),
+    });
+  }
+
+  let total = 0;
+  const blocks = results.map(({ piece, items }) => {
+    const head = `${piece.emoji || '•'} <b>${esc(piece.name_uk)}</b>`;
+    if (!items.length) return `${head}\n   <i>не знайшлося — дивись кнопку нижче</i>`;
+    const cheapest = Math.min(...items.map((x) => x.amount).filter((x) => x > 0));
+    if (Number.isFinite(cheapest)) total += cheapest;
+    const lines = items
+      .map((x) => `   • <a href="${esc(x.url)}">${esc(x.title)}</a> — <b>${esc(x.price)}</b>${x.size ? ` · ${esc(x.size)}` : ''}`)
+      .join('\n');
+    return `${head}\n${lines}`;
+  });
+
+  const totalLine = total > 0 ? `\n\n💰 Весь образ — від <b>${total.toFixed(2).replace('.', ',')} €</b> (найдешевші варіанти)` : '';
+  const blockedLine = blocked ? '\n\n⚠️ Частину речей Vinted не віддав напряму — відкрий пошук за кнопками.' : '';
+
+  await tg('sendMessage', {
+    chat_id: chatId,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    text: `👗 <b>${esc(outfit.style_uk)}</b>\n\n${blocks.join('\n\n')}${totalLine}${blockedLine}`,
+    reply_markup: {
+      inline_keyboard: outfit.items.map((it) => [
+        { text: `${it.emoji || '🔎'} ${it.name_uk}`, url: searchUrl(it.queries[0], outfit.price_max) },
+      ]),
+    },
+  });
+}
+
+// ---------- Одна річ ----------
+async function runItem(chatId, statusId, fileId, mediaType, caption) {
+  let analysis;
+  try {
+    const base64 = await downloadTelegramFile(fileId);
+    analysis = await analyzePhoto(base64, mediaType, caption);
+  } catch (e) {
+    console.error('Analyze error:', e.message);
+    return tg('editMessageText', {
+      chat_id: chatId,
+      message_id: statusId,
+      text: '😕 Не вдалося розпізнати річ на фото. Спробуй інше фото — краще одну річ крупним планом.',
+    });
+  }
+  await tg('editMessageText', { chat_id: chatId, message_id: statusId, text: `👀 Це ${analysis.item_uk}. Шукаю на Vinted…` });
+  return runSearch(chatId, statusId, analysis);
+}
+
+const OUTFIT_WORDS = /аутфіт|аутфит|образ|\bлук\b|outfit|look/i;
+
+function photoFrom(msg) {
+  if (msg?.photo?.length) return { fileId: msg.photo[msg.photo.length - 1].file_id, mediaType: 'image/jpeg' };
+  if (msg?.document?.mime_type?.startsWith('image/')) return { fileId: msg.document.file_id, mediaType: msg.document.mime_type };
+  return null;
+}
+
+// Кнопки «річ / аутфіт» під фото
+async function handleCallback(cq) {
+  const chatId = cq.message?.chat?.id;
+  const original = cq.message?.reply_to_message; // фото, на яке бот відповів кнопками
+  const photo = photoFrom(original);
+  await tg('answerCallbackQuery', { callback_query_id: cq.id });
+  if (!chatId || !photo) {
+    return tg('editMessageText', {
+      chat_id: chatId,
+      message_id: cq.message?.message_id,
+      text: '😕 Не бачу фото. Надішли його ще раз.',
+    });
+  }
+  const statusId = cq.message.message_id;
+  const caption = original.caption || '';
+  if (cq.data === 'outfit') {
+    await tg('editMessageText', { chat_id: chatId, message_id: statusId, text: '👗 Розбираю образ…' });
+    return runOutfit(chatId, statusId, [photo.fileId], caption);
+  }
+  await tg('editMessageText', { chat_id: chatId, message_id: statusId, text: '🔍 Розглядаю фото…' });
+  return runItem(chatId, statusId, photo.fileId, photo.mediaType, caption);
+}
+
 async function handleUpdate(update) {
+  if (update.callback_query) return handleCallback(update.callback_query);
+
   const msg = update.message;
   if (!msg) return;
   const chatId = msg.chat.id;
@@ -280,41 +492,50 @@ async function handleUpdate(update) {
     return tg('sendMessage', { chat_id: chatId, text: WELCOME, parse_mode: 'HTML' });
   }
 
-  // Фото (звичайне або надіслане як файл)
-  let fileId = null;
-  let mediaType = 'image/jpeg';
-  if (msg.photo?.length) {
-    fileId = msg.photo[msg.photo.length - 1].file_id; // найбільший розмір
-  } else if (msg.document?.mime_type?.startsWith('image/')) {
+  if (msg.document?.mime_type?.startsWith('image/')) {
     const ok = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
     if (!ok.includes(msg.document.mime_type)) {
       return tg('sendMessage', { chat_id: chatId, text: 'Надішли, будь ласка, JPG, PNG або WEBP 🙏' });
     }
-    fileId = msg.document.file_id;
-    mediaType = msg.document.mime_type;
   }
 
-  if (fileId) {
-    const status = await tg('sendMessage', { chat_id: chatId, text: '🔍 Розглядаю фото…' });
-    const statusId = status.result?.message_id;
-    let analysis;
-    try {
-      const base64 = await downloadTelegramFile(fileId);
-      analysis = await analyzePhoto(base64, mediaType, msg.caption || '');
-    } catch (e) {
-      console.error('Analyze error:', e.message);
-      return tg('editMessageText', {
+  const photo = photoFrom(msg);
+  if (photo) {
+    // Альбом із кількох фото → один аутфіт
+    if (msg.media_group_id && hasRedis) {
+      const album = await collectAlbum(msg, photo.fileId);
+      if (!album) return;
+      const status = await tg('sendMessage', {
         chat_id: chatId,
-        message_id: statusId,
-        text: '😕 Не вдалося розпізнати річ на фото. Спробуй інше фото — краще одну річ крупним планом.',
+        text: `👗 Отримав ${album.fileIds.length} фото, розбираю образ…`,
       });
+      const note =
+        album.fileIds.length > MAX_OUTFIT_PHOTOS
+          ? `\n\nℹ️ Аналізую перші ${MAX_OUTFIT_PHOTOS} фото з ${album.fileIds.length}.`
+          : '';
+      return runOutfit(chatId, status.result?.message_id, album.fileIds, album.caption, note);
     }
-    await tg('editMessageText', {
+
+    // Підпис зі словом «аутфіт» → одразу весь образ
+    if (OUTFIT_WORDS.test(msg.caption || '')) {
+      const status = await tg('sendMessage', { chat_id: chatId, text: '👗 Розбираю образ…' });
+      return runOutfit(chatId, status.result?.message_id, [photo.fileId], msg.caption || '');
+    }
+
+    // Інакше — питаємо, що шукати
+    return tg('sendMessage', {
       chat_id: chatId,
-      message_id: statusId,
-      text: `👀 Це ${analysis.item_uk}. Шукаю на Vinted…`,
+      reply_to_message_id: msg.message_id,
+      text: 'Що шукаємо?',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '🔎 Схожу річ', callback_data: 'item' },
+            { text: '👗 Весь аутфіт', callback_data: 'outfit' },
+          ],
+        ],
+      },
     });
-    return runSearch(chatId, statusId, analysis);
   }
 
   // Текстовий пошук: AI перекладає запит на німецьку/англійську
