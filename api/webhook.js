@@ -43,25 +43,41 @@ async function downloadTelegramFile(fileId) {
 }
 
 // ---------- AI (розпізнавання фото, Groq) ----------
-const PROMPT = (caption) => `Ти допомагаєш знайти схожі речі на Vinted (${DOMAIN}).
+const LANG_RULES = `Правила для queries:
+- ТІЛЬКИ німецькою або англійською мовою. Жодних українських, російських чи інших слів, жодної кирилиці
+- перші два запити — німецькою (так пишуть більшість оголошень на Vinted у Німеччині), третій — англійською
+- бренди й назви моделей завжди латиницею в оригінальному написанні (Nike, Air Force 1, Levi's 501)
+- 2–5 слів кожен: бренд + модель/тип + колір/ключова ознака, напр. "Nike Air Max 90 weiß", "Levi's 501 Jeans blau", "Strickpullover beige", "black leather jacket"
+- від конкретного до загального; не вигадуй бренд, якщо не впевнений
+- якщо користувач вказав розмір — додай його до першого запиту
+- ціну НЕ додавай у запити, а винеси в price_max`;
+
+const JSON_SHAPE = `Поверни ТІЛЬКИ JSON без пояснень:
+{
+  "item_uk": "короткий опис речі українською (до 10 слів)",
+  "brand": "бренд, якщо відомий, інакше null",
+  "queries": ["найточніший запит", "ширший запит", "найширший запит"],
+  "price_max": число в євро, якщо користувач вказав максимальну ціну, інакше null
+}`;
+
+const PHOTO_PROMPT = (caption) => `Ти допомагаєш знайти схожі речі на Vinted.
 Подивись на фото і визнач, що це за річ (одяг, взуття, аксесуар, техніка, декор тощо).
 ${caption ? `Побажання користувача (врахуй їх): "${caption}"` : ''}
 
-Поверни ТІЛЬКИ JSON без пояснень:
-{
-  "item_uk": "короткий опис речі українською (до 10 слів)",
-  "brand": "бренд, якщо видно логотип або впевнено впізнається, інакше null",
-  "queries": ["найточніший запит", "ширший запит", "найширший запит"],
-  "price_max": число в євро, якщо користувач вказав максимальну ціну, інакше null
-}
+${JSON_SHAPE}
 
-Правила для queries:
-- це пошукові запити для Vinted, мовою оголошень на цьому сайті (для vinted.de — німецька, бренди й моделі латиницею)
-- 2–5 слів кожен: бренд + модель/тип + колір/ключова ознака, напр. "Nike Air Max 90 weiß", "Levi's 501 Jeans blau", "Strickpullover beige"
-- від конкретного до загального; не вигадуй бренд, якщо не впевнений
-- якщо користувач вказав розмір — додай його до першого запиту`;
+${LANG_RULES}`;
 
-async function analyzePhoto(base64, mediaType, caption) {
+const TEXT_PROMPT = (text) => `Ти допомагаєш знайти речі на Vinted. Користувач написав, що шукає (може бути будь-якою мовою):
+"${text}"
+
+Переклади й перетвори це на пошукові запити.
+
+${JSON_SHAPE}
+
+${LANG_RULES}`;
+
+async function askAI(content) {
   // Groq — безкоштовний OpenAI-сумісний API з підтримкою фото
   const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
@@ -73,15 +89,7 @@ async function analyzePhoto(base64, mediaType, caption) {
       model: MODEL,
       max_tokens: 2000,
       temperature: 0.2,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            { type: 'text', text: PROMPT(caption) },
-            { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } },
-          ],
-        },
-      ],
+      messages: [{ role: 'user', content }],
     }),
   });
   const data = await r.json();
@@ -90,10 +98,22 @@ async function analyzePhoto(base64, mediaType, caption) {
   const json = text.match(/\{[\s\S]*\}/);
   if (!json) throw new Error('AI не повернув результат');
   const parsed = JSON.parse(json[0]);
-  parsed.queries = (parsed.queries || []).filter(Boolean).slice(0, 3);
+  // Страховка: відкидаємо запити з кирилицею, лишаємо тільки DE/EN
+  parsed.queries = (parsed.queries || [])
+    .map((q) => String(q || '').trim())
+    .filter((q) => q && !/[\u0400-\u04FF]/.test(q))
+    .slice(0, 3);
   if (!parsed.queries.length) throw new Error('AI не зміг розпізнати річ');
   return parsed;
 }
+
+const analyzePhoto = (base64, mediaType, caption) =>
+  askAI([
+    { type: 'text', text: PHOTO_PROMPT(caption) },
+    { type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}` } },
+  ]);
+
+const analyzeText = (text) => askAI(TEXT_PROMPT(text));
 
 // ---------- Vinted ----------
 let vintedCookie = null;
@@ -186,7 +206,7 @@ const WELCOME = `👋 Привіт! Надішли мені <b>фото речі
 • <i>до 30€</i>
 • <i>тільки чорні</i>
 
-Або просто напиши текстом, що шукаєш.`;
+Або просто напиши текстом, що шукаєш — можна українською, я сам перекладу для пошуку 🇩🇪🇬🇧`;
 
 function queryButtons(queries, priceMax) {
   return queries.map((q) => [{ text: `🔎 ${q}`, url: searchUrl(q, priceMax) }]);
@@ -297,18 +317,30 @@ async function handleUpdate(update) {
     return runSearch(chatId, statusId, analysis);
   }
 
-  // Текстовий пошук
+  // Текстовий пошук: AI перекладає запит на німецьку/англійську
   if (msg.text) {
-    const q = msg.text.trim().slice(0, 100);
-    const priceMatch = q.match(/до\s*(\d+)\s*(€|eur|євро)?/i);
-    const query = q.replace(/до\s*\d+\s*(€|eur|євро)?/i, '').trim() || q;
+    const q = msg.text.trim().slice(0, 150);
     const status = await tg('sendMessage', { chat_id: chatId, text: '🔍 Шукаю на Vinted…' });
-    return runSearch(chatId, status.result?.message_id, {
-      item_uk: query,
-      queries: [query],
-      price_max: priceMatch ? Number(priceMatch[1]) : null,
-    });
+    let analysis;
+    try {
+      analysis = await analyzeText(q);
+    } catch (e) {
+      console.error('Text analyze error:', e.message);
+      // Запасний варіант: шукаємо як є, якщо запит уже латиницею
+      const priceMatch = q.match(/(?:до|bis|under|max)\s*(\d+)\s*(€|eur|євро)?/i);
+      const query = q.replace(/(?:до|bis|under|max)\s*\d+\s*(€|eur|євро)?/i, '').trim() || q;
+      if (/[\u0400-\u04FF]/.test(query)) {
+        return tg('editMessageText', {
+          chat_id: chatId,
+          message_id: status.result?.message_id,
+          text: '😕 Не вдалося перекласти запит. Спробуй написати німецькою або англійською, напр. «Nike Air Force weiß».',
+        });
+      }
+      analysis = { item_uk: query, queries: [query], price_max: priceMatch ? Number(priceMatch[1]) : null };
+    }
+    return runSearch(chatId, status.result?.message_id, analysis);
   }
+
 
   return tg('sendMessage', { chat_id: chatId, text: 'Надішли фото речі або напиши, що шукаєш 📸' });
 }
