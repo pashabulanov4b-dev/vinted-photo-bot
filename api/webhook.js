@@ -1,7 +1,9 @@
 // Vinted Photo Search Bot — Telegram webhook (Vercel serverless function)
 // Фото → безкоштовний AI (Groq) розпізнає річ → пошук на Vinted → схожі оголошення
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// Прибираємо пробіли, лапки й випадковий префікс "bot", щоб токен з Vercel завжди був чистим
+const BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/^['"]|['"]$/g, '').replace(/^bot/i, '');
+if (!BOT_TOKEN) console.error('TELEGRAM_BOT_TOKEN не задано у Vercel → Settings → Environment Variables');
 const TG = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const TG_FILE = `https://api.telegram.org/file/bot${BOT_TOKEN}`;
 const DOMAIN = process.env.VINTED_DOMAIN || 'www.vinted.de';
