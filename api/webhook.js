@@ -44,38 +44,57 @@ async function downloadTelegramFile(fileId) {
 
 // ---------- AI (розпізнавання фото, Groq) ----------
 const LANG_RULES = `Правила для queries:
-- ТІЛЬКИ німецькою або англійською мовою. Жодних українських, російських чи інших слів, жодної кирилиці
+- ТІЛЬКИ німецькою або англійською мовою. Жодної кирилиці
 - перші два запити — німецькою (так пишуть більшість оголошень на Vinted у Німеччині), третій — англійською
-- бренди й назви моделей завжди латиницею в оригінальному написанні (Nike, Air Force 1, Levi's 501)
-- 2–5 слів кожен: бренд + модель/тип + колір/ключова ознака, напр. "Nike Air Max 90 weiß", "Levi's 501 Jeans blau", "Strickpullover beige", "black leather jacket"
-- від конкретного до загального; не вигадуй бренд, якщо не впевнений
-- якщо користувач вказав розмір — додай його до першого запиту
-- ціну НЕ додавай у запити, а винеси в price_max`;
+- КОЖЕН запит обовʼязково містить головну відмінну ознаку речі: візерунок (kariert/Karo, gestreift, geblümt, Camouflage…) і/або матеріал (Cord, Denim, Leder, Strick, Fleece, Flanell, Satin…), якщо вони є
+- бренди й назви моделей латиницею в оригінальному написанні; бренд лише якщо видно логотип або впізнаєш напевно
+- 2–5 слів: (бренд) + тип речі + візерунок/матеріал + колір, напр. "Karohemd rot schwarz", "Flanellhemd kariert", "Cordhose braun", "red black plaid shirt"
+- якщо користувач вказав розмір — додай його до першого запиту; ціну НЕ додавай, а винеси в price_max`;
 
-const JSON_SHAPE = `Поверни ТІЛЬКИ JSON без пояснень:
+const FILTER_RULES = `Правила для must_have / must_not (для перевірки назв оголошень):
+- must_have: 1–3 групи синонімів, кожна група — ключова ознака речі (тип речі, візерунок, матеріал). Слова короткі, в нижньому регістрі, німецькою І англійською, можна корені. Напр. для клітчастої сорочки: [["hemd","shirt","bluse"],["karo","kariert","check","plaid","tartan","flanell"]]
+- must_not: корені слів, які означають СХОЖУ, але ІНШУ річ, з якою легко сплутати. Напр. для клітчастої сорочки: ["cord","corduroy","jeans","denim","gestreift","stripe"]; для шкіряної куртки: ["kunstleder"] лише якщо явно не штучна
+- не додавай у must_not колір чи слова, які можуть бути в назві схожої речі`;
+
+const ATTR_SHAPE = `"attributes": {
+    "category": "тип речі",
+    "pattern": "візерунок (однотонний / клітинка / смужка / квітковий / принт / лого…)",
+    "material": "матеріал/фактура, наскільки видно",
+    "colors": "основні кольори",
+    "details": "крій, комір, ґудзики, кишені, посадка, довжина — найпомітніше"
+  }`;
+
+const JSON_SHAPE = `Спершу уважно розглянь річ, потім поверни ТІЛЬКИ JSON без пояснень:
 {
-  "item_uk": "короткий опис речі українською (до 10 слів)",
+  ${ATTR_SHAPE},
+  "item_uk": "короткий опис речі українською з візерунком і матеріалом (до 10 слів)",
   "brand": "бренд, якщо відомий, інакше null",
-  "queries": ["найточніший запит", "ширший запит", "найширший запит"],
+  "queries": ["найточніший запит", "ширший запит", "запит англійською"],
+  "must_have": [["синоніми ознаки 1"], ["синоніми ознаки 2"]],
+  "must_not": ["корінь1", "корінь2"],
   "price_max": число в євро, якщо користувач вказав максимальну ціну, інакше null
 }`;
 
-const PHOTO_PROMPT = (caption) => `Ти допомагаєш знайти схожі речі на Vinted.
-Подивись на фото і визнач, що це за річ (одяг, взуття, аксесуар, техніка, декор тощо).
-${caption ? `Побажання користувача (врахуй їх): "${caption}"` : ''}
+const PHOTO_PROMPT = (caption) => `Ти експерт з одягу і допомагаєш знайти на Vinted МАКСИМАЛЬНО схожу річ.
+Подивись на фото і визнач, що це за річ (одяг, взуття, аксесуар, техніка, декор тощо). Звертай особливу увагу на візерунок, матеріал і фактуру: клітинку не плутай з вельветом (рубчик), смужку з клітинкою, денім з бавовною.
+${caption ? `Побажання користувача (врахуй їх, вони важливіші за фото): "${caption}"` : ''}
 
 ${JSON_SHAPE}
 
-${LANG_RULES}`;
+${LANG_RULES}
+
+${FILTER_RULES}`;
 
 const TEXT_PROMPT = (text) => `Ти допомагаєш знайти речі на Vinted. Користувач написав, що шукає (може бути будь-якою мовою):
 "${text}"
 
-Переклади й перетвори це на пошукові запити.
+Переклади й перетвори це на пошукові запити. attributes заповни з тексту, невідоме — null.
 
 ${JSON_SHAPE}
 
-${LANG_RULES}`;
+${LANG_RULES}
+
+${FILTER_RULES}`;
 
 async function askJSON(content) {
   // Groq — безкоштовний OpenAI-сумісний API з підтримкою фото
@@ -88,7 +107,7 @@ async function askJSON(content) {
     body: JSON.stringify({
       model: MODEL,
       max_tokens: 2000,
-      temperature: 0.2,
+      temperature: 0.1,
       messages: [{ role: 'user', content }],
     }),
   });
@@ -132,7 +151,14 @@ ${caption ? `Побажання користувача (врахуй їх): "${c
   "style_uk": "стиль образу українською (до 8 слів)",
   "price_max": число в євро, якщо користувач вказав бюджет на ОДНУ річ, інакше null,
   "items": [
-    { "emoji": "один емодзі для речі", "name_uk": "назва речі українською (до 6 слів)", "queries": ["точний запит", "ширший запит"] }
+    {
+      "emoji": "один емодзі",
+      "photo": номер фото (1, 2, 3…), де цю річ видно найкраще,
+      "name_uk": "назва речі українською з візерунком/матеріалом (до 6 слів)",
+      "queries": ["точний запит", "ширший запит"],
+      "must_have": [["синоніми типу речі"], ["синоніми візерунку чи матеріалу"]],
+      "must_not": ["корені схожих, але інших речей"]
+    }
   ]
 }
 
@@ -140,7 +166,10 @@ ${caption ? `Побажання користувача (врахуй їх): "${c
 - ТІЛЬКИ німецькою або англійською, жодної кирилиці
 - перший запит — німецькою, другий — німецькою або англійською
 - бренди латиницею, лише якщо видно логотип; не вигадуй бренд
-- 2–5 слів: (бренд) + тип речі + колір/матеріал/фасон, напр. "Lederjacke schwarz oversize", "Mom Jeans hellblau", "chunky sneaker white"`;
+- КОЖЕН запит містить візерунок і/або матеріал, якщо вони є (kariert, gestreift, Cord, Denim, Leder, Strick…). Клітинку не плутай з вельветом, смужку з клітинкою
+- 2–5 слів: (бренд) + тип речі + візерунок/матеріал + колір, напр. "Lederjacke schwarz", "Mom Jeans hellblau", "Karohemd rot", "chunky sneaker white"
+
+${FILTER_RULES}`;
 
 async function analyzeOutfit(images, caption) {
   const parsed = await askJSON([
@@ -223,20 +252,84 @@ function normalizeItem(it) {
   };
 }
 
-// Йдемо від точного запиту до ширшого, поки не наберемо достатньо результатів
-async function findSimilar(queries, priceMax, limit = MAX_RESULTS) {
+// ---------- Точність: фільтр за ключовими словами + візуальна перевірка ----------
+const norm = (t = '') =>
+  String(t).toLowerCase().replace(/ä/g, 'a').replace(/ö/g, 'o').replace(/ü/g, 'u').replace(/ß/g, 'ss');
+
+const cleanWords = (arr) => (Array.isArray(arr) ? arr : []).map((w) => norm(w).trim()).filter((w) => w.length >= 3);
+
+function scoreItem(item, mustHave, mustNot) {
+  const text = norm(`${item.title} ${item.brand}`);
+  if (mustNot.some((w) => text.includes(w))) return -100; // явно інша річ
+  let score = 0;
+  for (const group of mustHave) if (group.some((w) => text.includes(w))) score += 10;
+  return score;
+}
+
+// Збираємо кандидатів з усіх запитів, викидаємо явно інші речі, сортуємо за збігом ознак
+async function findCandidates(analysis, pool = 30) {
+  const mustHave = (analysis.must_have || []).map(cleanWords).filter((g) => g.length).slice(0, 3);
+  const mustNot = cleanWords(analysis.must_not);
   const seen = new Set();
-  const results = [];
-  for (const q of queries) {
-    const items = await searchVinted(q, priceMax);
-    for (const it of items) {
-      if (seen.has(it.id)) continue;
-      seen.add(it.id);
-      results.push(it);
-      if (results.length >= limit) return results;
+  const all = [];
+  let errors = 0;
+  for (const [qi, q] of analysis.queries.entries()) {
+    let items = [];
+    try {
+      items = await searchVinted(q, analysis.price_max);
+    } catch (e) {
+      errors++;
+      console.error('Vinted search error:', e.message);
+      continue;
     }
+    items.forEach((it, pos) => {
+      if (seen.has(it.id)) return;
+      seen.add(it.id);
+      // невеликий бонус за точніший запит і вищу позицію у видачі Vinted
+      it.score = scoreItem(it, mustHave, mustNot) + (2 - qi) + (20 - pos) / 20;
+      if (it.score > -50) all.push(it);
+    });
+    if (all.filter((x) => x.score >= mustHave.length * 10).length >= pool) break;
   }
-  return results;
+  if (!all.length && errors) throw new Error('Vinted недоступний');
+  return all.sort((a, b) => b.score - a.score).slice(0, pool);
+}
+
+// AI порівнює оригінальне фото з фото оголошень (Groq: до 3 фото за запит → оригінал + 2 кандидати)
+async function verifyPair(original, attrs, pair, focus) {
+  const parsed = await askJSON([
+    {
+      type: 'text',
+      text: `Перше фото — ${focus ? `образ; користувач шукає з нього лише ОДНУ річ: «${focus}». Інші речі на фото ігноруй` : 'річ, яку шукає користувач'}${attrs ? ` (${JSON.stringify(attrs)})` : ''}. Далі ${pair.length} фото оголошень з Vinted.
+Оціни кожне оголошення від 0 до 10: наскільки це ТА САМА або дуже схожа річ. Головне — тип речі, візерунок і матеріал, потім колір і крій.
+Інший візерунок чи матеріал (напр. вельвет замість клітинки, смужка замість клітинки) — максимум 3. Якщо на фото оголошення інша річ — 0.
+Поверни ТІЛЬКИ JSON: {"scores": [${pair.map(() => 'число').join(', ')}]}`,
+    },
+    { type: 'image_url', image_url: { url: `data:${original.mediaType};base64,${original.base64}` } },
+    ...pair.map((it) => ({ type: 'image_url', image_url: { url: it.photo } })),
+  ]);
+  return pair.map((_, i) => Number(parsed.scores?.[i]));
+}
+
+async function verifyVisually(original, attrs, candidates, keep, focus = null, maxCheck = 10) {
+  const toCheck = candidates.filter((c) => c.photo).slice(0, maxCheck);
+  const pairs = [];
+  for (let i = 0; i < toCheck.length; i += 2) pairs.push(toCheck.slice(i, i + 2));
+  const results = await Promise.allSettled(pairs.map((p) => verifyPair(original, attrs, p, focus)));
+  let checked = 0;
+  results.forEach((r, i) => {
+    if (r.status !== 'fulfilled') return console.error('Verify error:', r.reason?.message);
+    pairs[i].forEach((it, j) => {
+      const v = r.value[j];
+      if (Number.isFinite(v)) {
+        it.visual = v;
+        checked++;
+      }
+    });
+  });
+  if (!checked) return candidates.slice(0, keep); // перевірка не вдалась — лишаємо текстовий рейтинг
+  const good = toCheck.filter((c) => (c.visual ?? 0) >= 6).sort((a, b) => b.visual - a.visual || b.score - a.score);
+  return good.slice(0, keep);
 }
 
 // ---------- Відповіді користувачу ----------
@@ -294,16 +387,22 @@ async function sendFallback(chatId, analysis, reason) {
     parse_mode: 'HTML',
     text: `🧥 Розпізнав: <b>${esc(item_uk)}</b>\n\n${
       reason === 'empty'
-        ? 'На жаль, точних збігів не знайшлося.'
+        ? 'Точних збігів не знайшлося — я відсіяв оголошення, які не схожі на твою річ.'
         : 'Vinted зараз не віддав результати напряму.'
     } Відкрий пошук за кнопками 👇`,
     reply_markup: { inline_keyboard: queryButtons(queries, price_max) },
   });
 }
 
-async function runSearch(chatId, statusId, analysis) {
+async function runSearch(chatId, statusId, analysis, original = null) {
   try {
-    const items = await findSimilar(analysis.queries, analysis.price_max);
+    let items = await findCandidates(analysis);
+    if (original && items.length) {
+      if (statusId) await tg('editMessageText', { chat_id: chatId, message_id: statusId, text: `🧐 Порівнюю ${Math.min(items.length, 10)} оголошень з твоїм фото…` });
+      items = await verifyVisually(original, analysis.attributes, items, MAX_RESULTS);
+    } else {
+      items = items.slice(0, MAX_RESULTS);
+    }
     if (statusId) await tg('deleteMessage', { chat_id: chatId, message_id: statusId });
     if (!items.length) return sendFallback(chatId, analysis, 'empty');
     await sendResults(chatId, analysis, items);
@@ -363,6 +462,7 @@ async function runOutfit(chatId, statusId, fileIds, caption, extraNote = '') {
       images.push({ base64: await downloadTelegramFile(id), mediaType: 'image/jpeg' });
     }
     outfit = await analyzeOutfit(images, caption);
+    outfit.images = images;
   } catch (e) {
     console.error('Outfit analyze error:', e.message);
     return setStatus('😕 Не вдалося розібрати образ. Спробуй фото, де людину видно на повний зріст і речі добре помітно.');
@@ -378,7 +478,9 @@ async function runOutfit(chatId, statusId, fileIds, caption, extraNote = '') {
     const batch = outfit.items.slice(i, i + 2);
     const found = await Promise.all(
       batch.map((it) =>
-        findSimilar(it.queries, outfit.price_max, 3).catch((e) => {
+        findCandidates({ ...it, price_max: outfit.price_max }, 8)
+          .then((c) => verifyVisually(outfit.images[Math.min(Math.max((Number(it.photo) || 1) - 1, 0), outfit.images.length - 1)], null, c, 3, it.name_uk, 4))
+          .catch((e) => {
           console.error('Outfit search error:', e.message);
           blocked = true;
           return [];
@@ -434,8 +536,10 @@ async function runOutfit(chatId, statusId, fileIds, caption, extraNote = '') {
 // ---------- Одна річ ----------
 async function runItem(chatId, statusId, fileId, mediaType, caption) {
   let analysis;
+  let original;
   try {
     const base64 = await downloadTelegramFile(fileId);
+    original = { base64, mediaType };
     analysis = await analyzePhoto(base64, mediaType, caption);
   } catch (e) {
     console.error('Analyze error:', e.message);
@@ -446,7 +550,7 @@ async function runItem(chatId, statusId, fileId, mediaType, caption) {
     });
   }
   await tg('editMessageText', { chat_id: chatId, message_id: statusId, text: `👀 Це ${analysis.item_uk}. Шукаю на Vinted…` });
-  return runSearch(chatId, statusId, analysis);
+  return runSearch(chatId, statusId, analysis, original);
 }
 
 const OUTFIT_WORDS = /аутфіт|аутфит|образ|\bлук\b|outfit|look/i;
